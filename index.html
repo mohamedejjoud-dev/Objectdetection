@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Object Detection</title>
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body>
+  <div id="feed-area">
+    <div id="tracker-container">
+      <video id="webcam-video" playsinline muted autoplay></video>
+      <canvas id="detection-canvas"></canvas>
+    </div>
+    <div id="status-overlay" class="status-overlay">
+      <div class="status-spinner"></div>
+      <p id="status-message" class="status-message">Loading model...</p>
+    </div>
+  </div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
