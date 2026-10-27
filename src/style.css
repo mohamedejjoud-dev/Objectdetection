@@ -1,4 +1,4 @@
-/* Object Detection — minimal feed-only layout */
+/* Object Detection ï¿½ minimal feed-only layout */
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -44,7 +44,11 @@ html, body {
   top: 0; left: 0;
   width: 100%; height: 100%;
   pointer-events: none;
-  /* canvas NOT mirrored — keeps text readable */
+  /* match the video's object-fit: contain letterboxing, otherwise the overlay
+     stretches and boxes drift off their objects when the window aspect ratio
+     differs from the camera's */
+  object-fit: contain;
+  /* canvas NOT mirrored ï¿½ keeps text readable */
 }
 
 /* Loading / error overlay */

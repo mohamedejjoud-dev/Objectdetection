@@ -37,28 +37,60 @@ const MIN_CONF = {
   broccoli: 0.68, carrot: 0.68,
 };
 
-// Wristwatches are always small in frame. A real cell phone / donut / wall clock
-// is significantly larger. Threshold: <4.5% of frame area + near-square aspect ratio.
-// Covers analog watches, round smartwatches and square smartwatches (Apple Watch etc.)
-const WATCH_MAX_AREA = 0.045;
+// ── Wristwatch remap ─────────────────────────────────────────────────────────
+// A watch face is small, close to square, and mid-frame sized. Thresholds are
+// tight on purpose: an AirPods charging case (44×53mm ≈ AR 0.82) and a pair of
+// buds (≈0.2% of frame) fall outside them, so they no longer inherit "watch".
+const WATCH_MIN_AREA = 0.0025;   // smaller than a watch face at webcam distance
+const WATCH_MAX_AREA = 0.025;    // a watch is never this big in frame
+const WATCH_AR_MIN   = 0.85;     // face-only boxes: round (1.0) or square (≈1.0)
+const WATCH_AR_MAX   = 1.15;
 
+// ── Cell phone silhouette gate ─────────────────────────────────────────────────
+// COCO has no earbuds class, so when the model sees AirPods its best available
+// guess is `cell phone`. Geometry separates the two reliably enough:
+//   • a real phone is never smaller than PHONE_MIN_AREA in a webcam frame,
+//   • a phone held upright or lying flat is clearly rectangular — outside
+//     PHONE_AR_MIN/MAX — while a charging case sits at AR ≈ 0.75–1.3,
+//   • only a very large squarish box (a rotated phone up close) is allowed
+//     through the squarish path.
+// Anything failing these checks is dropped rather than captioned wrong.
+const PHONE_MIN_AREA    = 0.0075; // <0.75% of frame ⇒ buds / case, not a phone
+const PHONE_AR_MIN      = 0.75;   // portrait phone ≈ 0.5, case ≈ 0.82
+const PHONE_AR_MAX      = 1.40;   // landscape phone ≈ 2.0, case-on-side ≈ 1.25
+const PHONE_SQUARISH_OK = 0.05;   // squarish box ≥5% of frame = rotated phone up close
+
+// Filters + relabels raw detections. Returns a new array (may drop entries).
 function fixClasses(detections, frameArea) {
-  return detections.map(d => {
+  const out = [];
+  for (const d of detections) {
     const cat = (d.categories?.[0]?.categoryName ?? '').toLowerCase();
     const b = d.boundingBox;
     const ar = b.width / (b.height || 1);
     const frac = (b.width * b.height) / frameArea;
-    const watchSized = frac < WATCH_MAX_AREA && ar >= 0.5 && ar <= 2.0;
+    const watchSized =
+      frac >= WATCH_MIN_AREA && frac < WATCH_MAX_AREA &&
+      ar >= WATCH_AR_MIN && ar <= WATCH_AR_MAX;
 
     if ((cat === 'donut' || cat === 'clock' || cat === 'cell phone') && watchSized) {
-      return { ...d, categories: [{ ...d.categories[0], categoryName: 'watch' }] };
+      out.push({ ...d, categories: [{ ...d.categories[0], categoryName: 'watch' }] });
+      continue;
     }
-    return d;
-  });
+
+    if (cat === 'cell phone') {
+      const phoneShaped = ar <= PHONE_AR_MIN || ar >= PHONE_AR_MAX;
+      const bigEnough   = frac >= PHONE_MIN_AREA;
+      const squarishBig = frac >= PHONE_SQUARISH_OK;
+      if (!(bigEnough && (phoneShaped || squarishBig))) continue; // drop, don't mislabel
+    }
+
+    out.push(d);
+  }
+  return out;
 }
 
 class CentroidTracker {
-  constructor({ maxDisappeared = 5, iouThreshold = 0.30, confirmFrames = 3, boxAlpha = 0.35, scoreAlpha = 0.40 } = {}) {
+  constructor({ maxDisappeared = 5, iouThreshold = 0.30, confirmFrames = 3, boxAlpha = 0.35, scoreAlpha = 0.40, labelStableFrames = 2 } = {}) {
     this.nextId = 0;
     this.objects = new Map();
     this.maxDisappeared = maxDisappeared;
@@ -66,6 +98,7 @@ class CentroidTracker {
     this.confirmFrames = confirmFrames;
     this.boxAlpha = boxAlpha;
     this.scoreAlpha = scoreAlpha;
+    this.labelStableFrames = labelStableFrames;
   }
 
   static iou(a, b) {
@@ -124,17 +157,33 @@ class CentroidTracker {
       const rawCat   = det.categories?.[0]?.categoryName ?? obj.category;
 
       CentroidTracker.smoothBox(obj.box, det.boundingBox, this.boxAlpha);
-      obj.score = obj.score * (1 - this.scoreAlpha) + rawScore * this.scoreAlpha;
+      const prevScore = obj.score;
+      obj.score = prevScore * (1 - this.scoreAlpha) + rawScore * this.scoreAlpha;
 
-      // Only update label if new category is definitively more confident
-      if (rawCat !== obj.category && rawScore > obj.score + 0.08) {
+      // Label hysteresis. A new category must (a) hold for several consecutive
+      // frames and (b) actually beat the score we already trust, before we switch.
+      // This stops the caption flickering between plausible classes
+      // (cup/bottle, remote/cell phone, book/laptop, …).
+      if (rawCat === obj.category) {
+        obj.pendingCat = null;
+        obj.pendingFrames = 0;
+      } else if (rawCat === obj.pendingCat) {
+        obj.pendingFrames++;
+      } else {
+        obj.pendingCat = rawCat;
+        obj.pendingFrames = 1;
+      }
+
+      if (obj.pendingFrames >= this.labelStableFrames && rawScore >= prevScore + 0.05) {
         obj.category = rawCat;
+        obj.pendingCat = null;
+        obj.pendingFrames = 0;
       }
 
       obj.cx = obj.box.originX + obj.box.width  / 2;
       obj.cy = obj.box.originY + obj.box.height / 2;
       obj.disappeared = 0;
-      obj.seenFrames  = Math.min((obj.seenFrames ?? 0) + 1, this.confirmFrames + 1);
+      obj.seenFrames  = Math.min((obj.seenFrames ?? 0) + 1, 12);
 
       matched.add(di);
       used.add(id);
@@ -164,14 +213,27 @@ class CentroidTracker {
       box: { originX: b.originX, originY: b.originY, width: b.width, height: b.height },
       category:    det.categories?.[0]?.categoryName ?? 'object',
       score:       det.categories?.[0]?.score ?? 0,
+      pendingCat:  null,
+      pendingFrames: 0,
       disappeared: 0,
       seenFrames:  1,
     });
   }
 
+  // Evidence-based confirmation. A confidently-scored object must hold for 3
+  // frames; a weak-but-plausible one (e.g. an oddly-shaped box the model only
+  // half-recognises) must hold for 5–8 frames instead of being hard-thresholded
+  // away. Real objects stay put long enough to accumulate the evidence; noise
+  // flickers in and out before it can.
+  _requiredFrames(score) {
+    if (score >= 0.50) return this.confirmFrames;  // 3 frames — confident
+    if (score >= 0.35) return Math.max(this.confirmFrames, 5);
+    return 8;                                      // ~0.25s of proof for the weakest
+  }
+
   _output() {
     return [...this.objects.values()].filter(
-      o => o.disappeared === 0 && o.seenFrames >= this.confirmFrames
+      o => o.disappeared === 0 && o.seenFrames >= this._requiredFrames(o.score)
     );
   }
 
@@ -281,12 +343,18 @@ class Detector {
     this.lastTs    = -1;
     this.frameCount = 0;
     this.lastFpsTs  = performance.now();
+    this.lastVideoTime = -1;
+    this.inferCount = 0;
+    this.inferTimes = [];
+    this.modelTuned = false;
 
-    // scoreThreshold fed to MediaPipe is low (0.25) so we get more candidates;
+    // Model threshold is low (0.15) so we get more candidates; precision comes
+    // from the tracker, not from a hard cut-off: `CentroidTracker._output()`
+    // demands more consecutive frames the weaker a detection's score is.
     // displayThreshold is our own filter applied after class corrections.
-    this.conf = { score: 0.25, display: 0.38, iou: 0.50, maxResults: 15 };
+    this.conf = { score: 0.15, display: 0.28, iou: 0.50, maxResults: 15 };
 
-    this.tracker  = new CentroidTracker({ maxDisappeared: 6, iouThreshold: 0.25, confirmFrames: 2, boxAlpha: 0.40, scoreAlpha: 0.45 });
+    this.tracker  = new CentroidTracker({ maxDisappeared: 6, iouThreshold: 0.25, confirmFrames: 3, boxAlpha: 0.40, scoreAlpha: 0.45, labelStableFrames: 2 });
     this.renderer = new Renderer(this.canvas);
   }
 
@@ -304,16 +372,21 @@ class Detector {
     }
   }
 
-  async _loadModel() {
+  // Lite2 (512px input) detects materially more objects more correctly than
+  // Lite0 (320px input), so it is the default. Lite0 remains the fallback for
+  // devices where Lite2 is too slow — see _trackInference().
+  async _loadModel(kind = 'accurate') {
     if (this.detector) {
       try { this.detector.close(); } catch (_) {}
       this.detector = null;
     }
 
-    const models = [
-      'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
-      'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float32/1/efficientdet_lite2.tflite',
-    ];
+    const models = kind === 'fast'
+      ? ['https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite']
+      : [
+          'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float32/1/efficientdet_lite2.tflite',
+          'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
+        ];
 
     for (const url of models) {
       for (const delegate of ['GPU', 'CPU']) {
@@ -342,7 +415,10 @@ class Detector {
     this._status('Starting camera…');
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        video: {
+          width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user',
+          focusMode: 'continuous', // keep hunting/blurring from softening the model input
+        },
         audio: false,
       });
       this.video.srcObject = this.stream;
@@ -353,6 +429,7 @@ class Detector {
       this._syncCanvas();
       this.running = true;
       this.lastTs  = -1;
+      this.lastVideoTime = -1;
       this.tracker.reset();
       this._hideOverlay();
       this._loop();
@@ -384,17 +461,25 @@ class Detector {
 
     if (!this.detector || this.video.readyState < 2 || this.video.paused || this.video.videoWidth === 0) return;
 
+    // Run inference only on genuinely new camera frames. Re-detecting the same
+    // frame at display refresh rate wastes the time budget and makes the temporal
+    // filters (confirmation, label hysteresis) count duplicates as evidence.
+    if (this.video.currentTime === this.lastVideoTime) return;
+    this.lastVideoTime = this.video.currentTime;
+
     this._syncCanvas();
 
     const ts = Math.max(Math.round(now), this.lastTs + 1);
     this.lastTs = ts;
 
+    const t0 = performance.now();
     let raw = [];
     try {
       raw = this.detector.detectForVideo(this.video, ts).detections ?? [];
     } catch (e) {
       console.warn('[Detector] inference:', e);
     }
+    this._trackInference(performance.now() - t0);
 
     const frameArea = (this.canvas.width || 1280) * (this.canvas.height || 720);
 
@@ -416,6 +501,29 @@ class Detector {
     );
 
     this.renderer.drawAll(this.tracker.update(dets));
+  }
+
+  // Adaptive model choice: after warm-up, if Lite2 averages slower than ~150ms
+  // per frame, swap to Lite0 so the feed stays live. Runs once.
+  _trackInference(ms) {
+    if (this.modelTuned) return;
+    this.inferCount++;
+    if (this.inferCount <= 10) return;          // skip model warm-up frames
+    this.inferTimes.push(ms);
+    if (this.inferTimes.length < 30) return;
+
+    this.modelTuned = true;
+    const mean = this.inferTimes.reduce((a, b) => a + b, 0) / this.inferTimes.length;
+    if (mean <= 150) return;
+
+    console.warn(`[Detector] ${mean.toFixed(0)}ms/frame — downgrading to EfficientDet-Lite0`);
+    if (this.detector) {
+      try { this.detector.close(); } catch (_) {}
+      this.detector = null;
+    }
+    this._loadModel('fast').catch(() =>
+      this._loadModel('accurate').catch(e => console.warn('[Detector] reload failed:', e))
+    );
   }
 
   _nms(detections, thresh) {
@@ -465,4 +573,5 @@ window.addEventListener('DOMContentLoaded', () => {
   const app = new Detector();
   app.init();
   window.__app = app;
+  window.__fixClasses = fixClasses; // test hook
 });
